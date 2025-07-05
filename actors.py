@@ -2,6 +2,18 @@ import ray
 from dataclasses import dataclass
 import torch
 from typing import List
+import threading
+
+
+class Mutex:
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        self.lock.acquire()
+
+    def release(self):
+        self.lock.release()
 
 
 @dataclass
@@ -89,16 +101,22 @@ class Processor:
             torch.cuda.Stream() for _ in range(processor_params.max_tasks_in_flight)
         ]
         self.current_cuda_stream = 0
+        self.stream_mutex = Mutex()
 
-    def process(self, data: Data) -> bool:
+    def get_cuda_stream_index(self) -> int:
+        self.stream_mutex.acquire()
+        cuda_stream_index = self.current_cuda_stream
         self.current_cuda_stream = (self.current_cuda_stream + 1) % len(
             self.cuda_streams
         )
+        self.stream_mutex.release()
 
-        with torch.cuda.stream(self.cuda_streams[self.current_cuda_stream]):
-            print(
-                f"Starting processing {data.id} on stream {self.current_cuda_stream} "
-            )
+        return cuda_stream_index
+
+    def process(self, data: Data) -> bool:
+        cuda_stream_index = self.get_cuda_stream_index()
+        with torch.cuda.stream(self.cuda_streams[cuda_stream_index]):
+            print(f"Starting processing {data.id} on stream {cuda_stream_index} ")
 
             # do something to process the data
             # we'll do something dummy here which does CPU->GPU and does some GPU computations
