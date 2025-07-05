@@ -1,7 +1,7 @@
 import ray
 from dataclasses import dataclass
-import time
-import random
+import torch
+from typing import List
 
 
 @dataclass
@@ -12,7 +12,7 @@ class Params:
 
 @dataclass
 class FeederParams(Params):
-    max_samples: int = 20
+    max_samples: int = 50
 
 
 @dataclass
@@ -30,13 +30,13 @@ class Data:
     id: int
 
 
-class RequestManager:
+class ActorsRequestManager:
     def __init__(self, max_tasks_in_flight: int):
         print(
             f"Initializing RequestManager with {max_tasks_in_flight} concurrent tasks"
         )
         self.max_tasks_in_flight = max_tasks_in_flight
-        self.futures = []
+        self.futures: List[ray.ObjectRef] = []
 
     def handle_task(self, callback):
         # Make sure that not too many tasks are already in flight
@@ -48,7 +48,7 @@ class RequestManager:
         self.futures.append(callback())
 
     def finish(self):
-        ready, self.futures = ray.wait(self.futures)
+        ready, self.futures = ray.wait(self.futures, num_returns=len(self.futures))
         print("All tasks completed")
         _ = ray.get(ready)  # you can do something with the returned values
 
@@ -61,11 +61,13 @@ class Writer:
 
     def write(self, data) -> None:
         # dummy..
-        print(f"Writing {data}")
+        print("Writing data")
+        pass
 
 
-@ray.remote(
-    num_gpus=1, max_concurrency=10
+@ray.remote(  # type: ignore
+    num_gpus=1,
+    max_concurrency=10,
 )  # Processor is GPU enabled + define actual max concurrency
 class Processor:
     def __init__(self, processor_params: ProcessorParams, writer: Writer) -> None:
@@ -76,27 +78,54 @@ class Processor:
         self.writer = writer
 
         # use a request manager to make sure that not too many tasks are in flight
-        self.request_manager = RequestManager(
+        self.request_manager = ActorsRequestManager(
             max_tasks_in_flight=processor_params.max_tasks_in_flight
         )
 
-    def process(self, data: Data) -> None:
-        # do something to process the data
-        sleep_time = random.random() * 10
-        print(f"Processing {data} - sleeping for {sleep_time:.2f}s", flush=True)
-        time.sleep(sleep_time)
+        # run all the GPU tasks in a threadpool, with a cuda stream per thread
+        # this makes sure that we can saturate GPU use even if tehre's some CPU-GPU communication
+        self.max_tasks_in_flight = processor_params.max_tasks_in_flight
+        self.cuda_streams = [
+            torch.cuda.Stream() for _ in range(processor_params.max_tasks_in_flight)
+        ]
+        self.current_cuda_stream = 0
 
-        # when done, send the data to the writer
-        self.request_manager.handle_task(lambda: self.writer.write.remote(data))
+    def process(self, data: Data) -> bool:
+        self.current_cuda_stream = (self.current_cuda_stream + 1) % len(
+            self.cuda_streams
+        )
+
+        with torch.cuda.stream(self.cuda_streams[self.current_cuda_stream]):
+            print(
+                f"Starting processing {data.id} on stream {self.current_cuda_stream} "
+            )
+
+            # do something to process the data
+            # we'll do something dummy here which does CPU->GPU and does some GPU computations
+            # this is dumb but gets to show that the threadpool and cuda streams make sure that the GPU
+            # is saturated even if there's some CPU-GPU communication
+            dummy_inputs = torch.rand(10000, 10000, device="cpu")
+            dummy_inputs = dummy_inputs.to("cuda", non_blocking=True)
+            dummy_outputs = torch.cos(
+                torch.sqrt(torch.matmul(dummy_inputs, dummy_inputs))
+            )
+            dummy_outputs = dummy_outputs.cpu()
+            print(f"Processing finished for {data.id}")
+
+            # when done, send some data to the writer
+            # this is all dummy, we don't even send what we computed here, this is just an example
+            self.request_manager.handle_task(lambda: self.writer.write.remote(data))  # type: ignore
+            return True  # Could be something else
 
     def finish(self):
+        # Wait for all the delayed actors communications to finish
         self.request_manager.finish()
 
     def __del__(self):
         self.finish()
 
 
-@ray.remote(max_concurrency=10)  # This will define the actual concurrent execution
+@ray.remote
 class Feeder:
     def __init__(self, feeder_params: FeederParams, processor: Processor) -> None:
         # do something to init the feeder
@@ -108,7 +137,7 @@ class Feeder:
         self.processor = processor
 
         # use a request manager to make sure that not too many tasks are in flight
-        self.request_manager = RequestManager(
+        self.request_manager = ActorsRequestManager(
             max_tasks_in_flight=feeder_params.max_tasks_in_flight
         )
 
@@ -116,9 +145,10 @@ class Feeder:
         # Dummy, replace with actual data reading
         for i in range(self.max_samples):
             self.request_manager.handle_task(
-                lambda: self.processor.process.remote(Data(id=i))
+                lambda: self.processor.process.remote(Data(id=i))  # type: ignore
             )
 
+        # Could be different, but we enforce here that the feeder will not return before all of its requests have returned
         self.finish()
 
     def finish(self):

@@ -24,7 +24,7 @@ def orchestrate(max_concurrent_tasks: int):
         feeder = Feeder.remote(FeederParams(name=f"feeder_{i}"), processor=processor)
         return feeder, processor, writer
 
-    print(f"Creating {n_gpus} pipelines - one per GPU")
+    print(f"Creating {n_gpus} pipeline{'s' if n_gpus > 1 else ''} - one per GPU")
     pipelines = [create_pipeline(i) for i in range(n_gpus)]
 
     # Start the feeders
